@@ -62,9 +62,13 @@ private:
     // que se envía la respuesta completa sin importar el tamaño
     bool SendMessage(ClientSocket *client, const string &response) {
         uchar payload[];
-        StringToCharArray(response, payload, 0, StringLen(response), CP_UTF8);
-        int total  = ArraySize(payload) - 1; // excluir null terminator
+        // WHOLE_ARRAY convierte el string completo; el retorno incluye el null.
+        // Restar 1 para obtener los bytes reales a enviar.
+        int sz = StringToCharArray(response, payload, 0, WHOLE_ARRAY, CP_UTF8);
+        int total  = sz - 1;
         int offset = 0;
+
+        m_logger.Debug("SendMessage: " + IntegerToString(total) + " bytes a enviar");
 
         while(offset < total) {
             int remaining = total - offset;
