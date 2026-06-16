@@ -9,9 +9,8 @@
 #include "JSONHandler.mqh"
 #include "CandleProvider.mqh"
 
-#define MAX_MSG_BYTES       (10 * 1024 * 1024)  // 10 MB — límite de seguridad
-#define MAX_CONNECTIONS     10                   // conexiones a procesar por tick
-#define DRAIN_MAX_ITERS     32                   // iteraciones máx en DrainSocket
+#define MAX_MSG_BYTES    (10 * 1024 * 1024)  // 10 MB — límite de seguridad
+#define MAX_CONNECTIONS  10                   // conexiones a procesar por tick
 
 class CTCPServer {
 private:
@@ -22,70 +21,53 @@ private:
     int              m_port;
 
     // ---------------------------------------------------------------
-    // Protocolo: [4 bytes big-endian length][payload UTF-8]
+    // Protocolo: JSON plano sin framing
+    // Cliente envía JSON + cierra su lado (half-close / shutdown SHUT_WR)
+    // EA lee hasta recibir EOF, responde JSON plano y cierra la conexión
     // ---------------------------------------------------------------
     bool ReadMessage(ClientSocket *client, string &message) {
-        uchar header[4];
-        if(client.Receive(header, 4) != 4) {
-            m_logger.Warning("ReadMessage: no se pudo leer los 4 bytes del header");
+        uchar all[];
+        uchar chunk[];
+        ArrayResize(chunk, 4096);
+        int total = 0;
+
+        while(true) {
+            int got = client.Receive(chunk, 4096);
+            if(got <= 0) break; // EOF — cliente cerró su lado
+
+            int prev = ArraySize(all);
+            ArrayResize(all, prev + got);
+            ArrayCopy(all, chunk, prev, 0, got);
+            total += got;
+
+            if(total > MAX_MSG_BYTES) {
+                m_logger.Error("ReadMessage: mensaje demasiado grande (" +
+                               IntegerToString(total) + " bytes)");
+                return false;
+            }
+        }
+
+        if(total == 0) {
+            m_logger.Warning("ReadMessage: conexión cerrada sin datos");
             return false;
         }
 
-        uint length = ((uint)header[0] << 24) |
-                      ((uint)header[1] << 16) |
-                      ((uint)header[2] <<  8) |
-                       (uint)header[3];
-
-        if(length == 0 || length > MAX_MSG_BYTES) {
-            m_logger.Error(StringFormat(
-                "ReadMessage: longitud inválida=%u — posible mismatch de protocolo "
-                "(¿el cliente envía sin framing de 4 bytes?)", length));
-            return false;
-        }
-
-        uchar payload[];
-        ArrayResize(payload, (int)length);
-        if(client.Receive(payload, length) != (int)length) {
-            m_logger.Warning("ReadMessage: payload incompleto, esperado=" +
-                             IntegerToString(length));
-            return false;
-        }
-
-        message = CharArrayToString(payload, 0, (int)length, CP_UTF8);
+        message = CharArrayToString(all, 0, total, CP_UTF8);
+        m_logger.Debug("ReadMessage: " + IntegerToString(total) + " bytes recibidos");
         return true;
     }
 
-    // Envía respuesta con framing [4 bytes big-endian][payload UTF-8]
+    // Envía JSON plano sin framing — la conexión se cierra después (señal de EOF)
     bool SendMessage(ClientSocket *client, const string &response) {
         uchar payload[];
         StringToCharArray(response, payload, 0, StringLen(response), CP_UTF8);
         uint length = ArraySize(payload) - 1; // excluir null terminator
 
-        uchar header[4];
-        header[0] = (uchar)((length >> 24) & 0xFF);
-        header[1] = (uchar)((length >> 16) & 0xFF);
-        header[2] = (uchar)((length >>  8) & 0xFF);
-        header[3] = (uchar)( length        & 0xFF);
-
-        if(client.Send(header, 4) < 0) {
-            m_logger.Warning("SendMessage: error al enviar header");
-            return false;
-        }
         if(client.Send(payload, length) < 0) {
             m_logger.Warning("SendMessage: error al enviar payload");
             return false;
         }
         return true;
-    }
-
-    // Drena los bytes pendientes del socket para garantizar cierre FIN (no RST).
-    // Sin esto, delete client con datos no leídos emite RST al peer.
-    void DrainSocket(ClientSocket *client) {
-        uchar buf[];
-        ArrayResize(buf, 4096);
-        for(int i = 0; i < DRAIN_MAX_ITERS; i++) {
-            if(client.Receive(buf, 4096) <= 0) break;
-        }
     }
 
     // ---------------------------------------------------------------
@@ -164,30 +146,25 @@ private:
         return ERR_UNKNOWN_ACTION;
     }
 
-    // Procesa un cliente: siempre envía respuesta y siempre drena antes de cerrar
+    // Procesa un cliente: siempre envía respuesta JSON antes de cerrar
     void ProcessOneClient(ClientSocket *client) {
-        string request  = "";
-        string response = "";
+        string request = "";
 
         if(!ReadMessage(client, request)) {
-            // ReadMessage falló: enviar error y drenar antes de cerrar
-            // para evitar que delete client emita RST
+            // ReadMessage leyó todo — enviar error antes de cerrar
             m_logger.Error("ProcessOneClient: ReadMessage falló — respondiendo error");
             SendMessage(client, ERR_UNKNOWN_ACTION); // best-effort
-            DrainSocket(client);
             delete client;
             return;
         }
 
-        response = DispatchRequest(request);
+        string response = DispatchRequest(request);
 
         if(!SendMessage(client, response)) {
             m_logger.Warning("ProcessOneClient: SendMessage falló");
         }
 
-        // Drenar bytes residuales antes de cerrar para garantizar FIN limpio
-        DrainSocket(client);
-        delete client;
+        delete client; // FIN limpio — ReadMessage ya leyó todo el buffer
     }
 
 public:

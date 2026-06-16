@@ -15,7 +15,6 @@ Ejecutar:
 import json
 import os
 import socket
-import struct
 import time
 
 import pytest
@@ -59,27 +58,22 @@ class MT5Client:
                 pass
             self._sock = None
 
-    def _recv_exact(self, n: int) -> bytes:
-        """Lee exactamente n bytes del socket, lanzando OSError si no llegan."""
-        buf = b""
-        while len(buf) < n:
-            chunk = self._sock.recv(n - len(buf))
-            if not chunk:
-                raise OSError(f"Conexión cerrada después de {len(buf)}/{n} bytes")
-            buf += chunk
-        return buf
-
     def send_request(self, request: dict) -> dict:
-        """Envía una petición JSON con framing y devuelve la respuesta parseada."""
+        """Envía JSON plano, hace half-close y lee respuesta hasta EOF."""
         payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
-        header = struct.pack(">I", len(payload))          # 4 bytes big-endian
-        self._sock.sendall(header + payload)
+        self._sock.sendall(payload)
+        # Half-close: señala al EA que terminamos de enviar (EOF en su Receive)
+        self._sock.shutdown(socket.SHUT_WR)
 
-        resp_header = self._recv_exact(4)
-        resp_length = struct.unpack(">I", resp_header)[0]
-        assert resp_length > 0, "Respuesta con longitud cero"
-        resp_payload = self._recv_exact(resp_length)
-        return json.loads(resp_payload.decode("utf-8"))
+        chunks = []
+        while True:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+        raw = b"".join(chunks)
+        return json.loads(raw.decode("utf-8"))
 
     def __enter__(self):
         self.connect()
