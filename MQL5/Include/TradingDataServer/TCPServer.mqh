@@ -57,15 +57,30 @@ private:
         return true;
     }
 
-    // Envía JSON plano sin framing — la conexión se cierra después (señal de EOF)
+    // Envía JSON plano sin framing en chunks de 4 KB
+    // Send() puede retornar menos bytes de los solicitados — el bucle garantiza
+    // que se envía la respuesta completa sin importar el tamaño
     bool SendMessage(ClientSocket *client, const string &response) {
         uchar payload[];
         StringToCharArray(response, payload, 0, StringLen(response), CP_UTF8);
-        uint length = ArraySize(payload) - 1; // excluir null terminator
+        int total  = ArraySize(payload) - 1; // excluir null terminator
+        int offset = 0;
 
-        if(client.Send(payload, length) < 0) {
-            m_logger.Warning("SendMessage: error al enviar payload");
-            return false;
+        while(offset < total) {
+            int remaining = total - offset;
+            int chunkSize = MathMin(remaining, 4096);
+
+            uchar chunk[];
+            ArrayResize(chunk, chunkSize);
+            ArrayCopy(chunk, payload, 0, offset, chunkSize);
+
+            int sent = client.Send(chunk, chunkSize);
+            if(sent < 0) {
+                m_logger.Warning("SendMessage: error al enviar en offset=" +
+                                 IntegerToString(offset));
+                return false;
+            }
+            offset += sent;
         }
         return true;
     }

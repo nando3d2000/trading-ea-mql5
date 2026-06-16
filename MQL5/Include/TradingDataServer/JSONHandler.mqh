@@ -111,6 +111,8 @@ public:
     }
 
     // Construye la respuesta JSON con el array de velas
+    // NOTA: se usa concatenación directa — StringFormat tiene un límite
+    // de ~4096 chars de salida y truncaría respuestas grandes
     string BuildCandlesResponse(string symbol, string timeframe,
                                 MqlRates &rates[], int count) {
         string candles = "";
@@ -119,11 +121,10 @@ public:
             candles += CandleToJSON(rates[i]);
         }
 
-        return StringFormat(
-            "{\"status\":\"ok\",\"symbol\":\"%s\",\"timeframe\":\"%s\","
-            "\"count\":%d,\"candles\":[%s]}",
-            symbol, timeframe, count, candles
-        );
+        return "{\"status\":\"ok\",\"symbol\":\"" + symbol +
+               "\",\"timeframe\":\"" + timeframe +
+               "\",\"count\":" + IntegerToString(count) +
+               ",\"candles\":[" + candles + "]}";
     }
 
     // Construye una respuesta de error con el mensaje indicado
