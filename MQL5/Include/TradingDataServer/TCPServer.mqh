@@ -9,8 +9,9 @@
 #include "JSONHandler.mqh"
 #include "CandleProvider.mqh"
 
-#define MAX_MSG_BYTES    (10 * 1024 * 1024)  // 10 MB — límite de seguridad
-#define MAX_CONNECTIONS  10                   // conexiones simultáneas máximas
+#define MAX_MSG_BYTES       (10 * 1024 * 1024)  // 10 MB — límite de seguridad
+#define MAX_CONNECTIONS     10                   // conexiones a procesar por tick
+#define DRAIN_MAX_ITERS     32                   // iteraciones máx en DrainSocket
 
 class CTCPServer {
 private:
@@ -19,9 +20,10 @@ private:
     CJSONHandler    *m_json;
     CCandleProvider *m_candles;
     int              m_port;
-    int              m_activeConns;
 
+    // ---------------------------------------------------------------
     // Protocolo: [4 bytes big-endian length][payload UTF-8]
+    // ---------------------------------------------------------------
     bool ReadMessage(ClientSocket *client, string &message) {
         uchar header[4];
         if(client.Receive(header, 4) != 4) {
@@ -35,8 +37,9 @@ private:
                        (uint)header[3];
 
         if(length == 0 || length > MAX_MSG_BYTES) {
-            m_logger.Warning("ReadMessage: longitud inválida=" +
-                             IntegerToString(length));
+            m_logger.Error(StringFormat(
+                "ReadMessage: longitud inválida=%u — posible mismatch de protocolo "
+                "(¿el cliente envía sin framing de 4 bytes?)", length));
             return false;
         }
 
@@ -52,12 +55,11 @@ private:
         return true;
     }
 
-    // Envía respuesta precedida por header de 4 bytes big-endian con la longitud
+    // Envía respuesta con framing [4 bytes big-endian][payload UTF-8]
     bool SendMessage(ClientSocket *client, const string &response) {
         uchar payload[];
-        // StringToCharArray añade null terminator — usamos StringLen para excluirlo
         StringToCharArray(response, payload, 0, StringLen(response), CP_UTF8);
-        uint length = ArraySize(payload) - 1; // sin el null terminator
+        uint length = ArraySize(payload) - 1; // excluir null terminator
 
         uchar header[4];
         header[0] = (uchar)((length >> 24) & 0xFF);
@@ -76,54 +78,128 @@ private:
         return true;
     }
 
-    // Maneja la acción get_candles — validación y obtención de datos
+    // Drena los bytes pendientes del socket para garantizar cierre FIN (no RST).
+    // Sin esto, delete client con datos no leídos emite RST al peer.
+    void DrainSocket(ClientSocket *client) {
+        uchar buf[];
+        ArrayResize(buf, 4096);
+        for(int i = 0; i < DRAIN_MAX_ITERS; i++) {
+            if(client.Receive(buf, 4096) <= 0) break;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Handlers de acciones
+    // ---------------------------------------------------------------
     string HandleGetCandles(const TradingRequest &req) {
         if(req.symbol == "")    return ERR_MISSING_SYMBOL;
         if(req.timeframe == "") return ERR_MISSING_TIMEFRAME;
 
         ENUM_TIMEFRAMES period = m_json.ParseTimeframe(req.timeframe);
-        if(period == PERIOD_CURRENT) return ERR_INVALID_TIMEFRAME;
+        if(period == PERIOD_CURRENT) {
+            m_logger.Warning("HandleGetCandles: timeframe inválido '" +
+                             req.timeframe + "'");
+            return ERR_INVALID_TIMEFRAME;
+        }
 
         MqlRates rates[];
         int count = m_candles.GetCandles(req.symbol, period,
                                           req.from_ts, req.to_ts, rates);
 
-        if(m_candles.IsLimitError(count))  return ERR_TOO_MANY_CANDLES;
+        if(m_candles.IsLimitError(count)) return ERR_TOO_MANY_CANDLES;
 
         if(m_candles.IsNoDataError(count)) {
-            // Distinguir símbolo inexistente de rango sin datos
-            if(!SymbolSelect(req.symbol, false)) return ERR_SYMBOL_NOT_FOUND;
+            if(!SymbolSelect(req.symbol, false)) {
+                m_logger.Warning("HandleGetCandles: símbolo no encontrado '" +
+                                 req.symbol + "'");
+                return ERR_SYMBOL_NOT_FOUND;
+            }
             return ERR_NO_DATA;
         }
 
         return m_json.BuildCandlesResponse(req.symbol, req.timeframe, rates, count);
     }
 
-    // Despacha la petición y retorna el JSON de respuesta
+    // Retorna el timestamp más antiguo disponible para el símbolo/timeframe
+    string HandleGetOldestTs(const TradingRequest &req) {
+        if(req.symbol == "")    return ERR_MISSING_SYMBOL;
+        if(req.timeframe == "") return ERR_MISSING_TIMEFRAME;
+
+        ENUM_TIMEFRAMES period = m_json.ParseTimeframe(req.timeframe);
+        if(period == PERIOD_CURRENT) return ERR_INVALID_TIMEFRAME;
+
+        if(!SymbolSelect(req.symbol, true)) return ERR_SYMBOL_NOT_FOUND;
+
+        datetime oldest = (datetime)SeriesInfoInteger(req.symbol, period,
+                                                      SERIES_FIRSTDATE);
+        if(oldest == 0) {
+            m_logger.Warning("HandleGetOldestTs: SERIES_FIRSTDATE=0 para " +
+                             req.symbol + "/" + req.timeframe);
+            return ERR_NO_DATA;
+        }
+
+        return StringFormat(
+            "{\"status\":\"ok\",\"symbol\":\"%s\",\"timeframe\":\"%s\","
+            "\"oldest_ts\":%d}",
+            req.symbol, req.timeframe, (long)oldest);
+    }
+
+    // Despacha la petición y retorna el JSON de respuesta — NUNCA retorna ""
     string DispatchRequest(const string &json) {
         TradingRequest req;
-        if(!m_json.ParseRequest(json, req)) return ERR_UNKNOWN_ACTION;
+        if(!m_json.ParseRequest(json, req)) {
+            m_logger.Error("DispatchRequest: ParseRequest falló — JSON: " + json);
+            return ERR_UNKNOWN_ACTION;
+        }
 
-        m_logger.Debug("DispatchRequest: action=" + req.action +
-                       " symbol=" + req.symbol + " tf=" + req.timeframe);
+        // Loggear la acción recibida en la pestaña Experts para diagnóstico
+        m_logger.Info(StringFormat("Acción recibida: action=%s symbol=%s tf=%s",
+                                   req.action, req.symbol, req.timeframe));
 
-        if(req.action == "ping")        return m_json.BuildPongResponse();
-        if(req.action == "get_candles") return HandleGetCandles(req);
+        if(req.action == "ping")           return m_json.BuildPongResponse();
+        if(req.action == "get_candles")    return HandleGetCandles(req);
+        if(req.action == "get_oldest_ts")  return HandleGetOldestTs(req);
 
         m_logger.Warning("DispatchRequest: acción desconocida '" + req.action + "'");
         return ERR_UNKNOWN_ACTION;
+    }
+
+    // Procesa un cliente: siempre envía respuesta y siempre drena antes de cerrar
+    void ProcessOneClient(ClientSocket *client) {
+        string request  = "";
+        string response = "";
+
+        if(!ReadMessage(client, request)) {
+            // ReadMessage falló: enviar error y drenar antes de cerrar
+            // para evitar que delete client emita RST
+            m_logger.Error("ProcessOneClient: ReadMessage falló — respondiendo error");
+            SendMessage(client, ERR_UNKNOWN_ACTION); // best-effort
+            DrainSocket(client);
+            delete client;
+            return;
+        }
+
+        response = DispatchRequest(request);
+
+        if(!SendMessage(client, response)) {
+            m_logger.Warning("ProcessOneClient: SendMessage falló");
+        }
+
+        // Drenar bytes residuales antes de cerrar para garantizar FIN limpio
+        DrainSocket(client);
+        delete client;
     }
 
 public:
     CTCPServer(CLogger *logger, CJSONHandler *json,
                CCandleProvider *candles, int port)
         : m_server(NULL), m_logger(logger), m_json(json),
-          m_candles(candles), m_port(port), m_activeConns(0) {}
+          m_candles(candles), m_port(port) {}
 
     ~CTCPServer() { Stop(); }
 
     bool Start() {
-        if(m_server != NULL) return true; // ya iniciado
+        if(m_server != NULL) return true;
 
         m_server = new ServerSocket((ushort)m_port, false);
         if(!m_server.Created()) {
@@ -151,43 +227,25 @@ public:
         return (m_server != NULL && m_server.Created());
     }
 
-    // Llamar desde OnTimer() — Accept() es no bloqueante
-    // Receive() bloquea hasta recibir los datos o que la conexión cierre
+    // Llamar desde OnTimer() — procesa TODAS las conexiones pendientes en el tick
     void ProcessConnections() {
         if(!IsRunning()) {
-            // Intentar reiniciar si el socket se perdió
             m_logger.Warning("ProcessConnections: servidor caído, reintentando Start()");
             Start();
             return;
         }
 
-        if(m_activeConns >= MAX_CONNECTIONS) {
-            m_logger.Warning("ProcessConnections: máximo de conexiones alcanzado (" +
-                             IntegerToString(MAX_CONNECTIONS) + ")");
-            return;
+        // Procesar todas las conexiones pendientes en este tick del timer,
+        // no solo una — evita acumulación en el backlog cuando el scheduler
+        // envía múltiples símbolos en ráfaga
+        for(int i = 0; i < MAX_CONNECTIONS; i++) {
+            ClientSocket *client = m_server.Accept();
+            if(client == NULL) break; // no hay más conexiones pendientes
+
+            m_logger.Debug("Conexión aceptada (" + IntegerToString(i + 1) +
+                           " en este tick)");
+            ProcessOneClient(client); // client se elimina dentro
         }
-
-        ClientSocket *client = m_server.Accept();
-        if(client == NULL) return; // sin conexiones pendientes
-
-        m_activeConns++;
-        m_logger.Debug("Conexión aceptada (activas=" +
-                       IntegerToString(m_activeConns) + ")");
-
-        string request = "";
-        if(ReadMessage(client, request)) {
-            m_logger.Debug("Petición: " + request);
-            string response = DispatchRequest(request);
-            if(!SendMessage(client, response)) {
-                m_logger.Warning("ProcessConnections: fallo al enviar respuesta");
-            } else {
-                m_logger.Debug("Respuesta enviada (" +
-                               IntegerToString(StringLen(response)) + " bytes)");
-            }
-        }
-
-        delete client;
-        m_activeConns--;
     }
 };
 
