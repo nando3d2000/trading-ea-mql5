@@ -75,9 +75,9 @@ private:
             ArrayCopy(chunk, payload, 0, offset, chunkSize);
 
             int sent = client.Send(chunk, chunkSize);
-            if(sent < 0) {
+            if(sent <= 0) {
                 m_logger.Warning("SendMessage: error al enviar en offset=" +
-                                 IntegerToString(offset));
+                                 IntegerToString(offset) + " sent=" + IntegerToString(sent));
                 return false;
             }
             offset += sent;
