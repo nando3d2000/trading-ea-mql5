@@ -28,11 +28,19 @@ private:
     CLogger *m_logger;
 
     // Extrae el valor string de una clave JSON simple (sin anidamiento)
+    // Tolera espacios después de los dos puntos: "key": "value" y "key":"value"
     string ExtractString(const string &json, string key) {
-        string search = "\"" + key + "\":\"";
+        string search = "\"" + key + "\":";
         int start = StringFind(json, search);
         if(start < 0) return "";
         start += StringLen(search);
+        // Saltar espacios opcionales entre ':' y '"'
+        while(start < StringLen(json) &&
+              StringGetCharacter(json, start) == ' ') start++;
+        // Debe seguir una comilla de apertura
+        if(start >= StringLen(json) ||
+           StringGetCharacter(json, start) != '"') return "";
+        start++; // saltar comilla de apertura
         int end = StringFind(json, "\"", start);
         if(end < 0) return "";
         return StringSubstr(json, start, end - start);
