@@ -45,7 +45,7 @@ private:
     // no reportar "sin datos" en rangos que en realidad aún se están bajando.
     // Retorna true si la serie está sincronizada con el servidor.
     bool EnsureHistory(string symbol, ENUM_TIMEFRAMES period, datetime from_dt) {
-        datetime probe[];
+        MqlRates probe[];
         for(int i = 0; i < m_syncRetries; i++) {
             // Dispara la descarga cerca del inicio del rango solicitado
             CopyRates(symbol, period, from_dt, 1, probe);
@@ -128,7 +128,7 @@ public:
         if(!ValidateSymbol(symbol)) return 0;
 
         datetime serverOldest = 0;
-        datetime probe[];
+        MqlRates probe[];
         for(int i = 0; i < m_syncRetries; i++) {
             serverOldest = (datetime)SeriesInfoInteger(
                 symbol, period, SERIES_SERVER_FIRSTDATE);
