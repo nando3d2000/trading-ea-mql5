@@ -109,6 +109,9 @@ private:
 
         if(m_candles.IsLimitError(count)) return ERR_TOO_MANY_CANDLES;
 
+        // Histórico aún descargándose: el ingestor debe reintentar este bloque
+        if(m_candles.IsNotSyncedError(count)) return ERR_NOT_SYNCED;
+
         if(m_candles.IsNoDataError(count)) {
             if(!SymbolSelect(req.symbol, false)) {
                 m_logger.Warning("HandleGetCandles: símbolo no encontrado '" +
@@ -118,10 +121,14 @@ private:
             return ERR_NO_DATA;
         }
 
+        // count >= 0: incluye el caso de rango vacío legítimo (count == 0),
+        // que se responde como OK con un array vacío para que el ingestor
+        // avance el progreso en vez de abortar el backfill.
         return m_json.BuildCandlesResponse(req.symbol, req.timeframe, rates, count);
     }
 
-    // Retorna el timestamp más antiguo disponible para el símbolo/timeframe
+    // Retorna el timestamp de la vela más antigua que el BROKER ofrece para el
+    // símbolo/timeframe (no solo lo cargado localmente en el terminal).
     string HandleGetOldestTs(const TradingRequest &req) {
         if(req.symbol == "")    return ERR_MISSING_SYMBOL;
         if(req.timeframe == "") return ERR_MISSING_TIMEFRAME;
@@ -131,10 +138,9 @@ private:
 
         if(!SymbolSelect(req.symbol, true)) return ERR_SYMBOL_NOT_FOUND;
 
-        datetime oldest = (datetime)SeriesInfoInteger(req.symbol, period,
-                                                      SERIES_FIRSTDATE);
+        datetime oldest = m_candles.GetOldestServerTs(req.symbol, period);
         if(oldest == 0) {
-            m_logger.Warning("HandleGetOldestTs: SERIES_FIRSTDATE=0 para " +
+            m_logger.Warning("HandleGetOldestTs: sin fecha más antigua para " +
                              req.symbol + "/" + req.timeframe);
             return ERR_NO_DATA;
         }

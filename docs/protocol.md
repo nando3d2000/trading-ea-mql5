@@ -113,6 +113,36 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 Las velas se entregan en **orden cronológico ascendente** (la más antigua primero).
 
+Si el rango es válido pero no contiene velas (fin de semana, antes del inicio
+del histórico del broker), la respuesta es `status: "ok"` con `count: 0` y
+`candles: []` — **no es un error**. Esto permite al ingestor avanzar el progreso
+del backfill sin atascarse en huecos.
+
+---
+
+### `get_oldest_ts` — Vela más antigua disponible
+
+Devuelve el timestamp de la vela más antigua que el **broker** ofrece para el
+símbolo/timeframe (`SERIES_SERVER_FIRSTDATE`), no solo lo que ya está cargado en
+el terminal. El EA fuerza la sincronización del histórico antes de responder.
+
+**Petición:**
+```json
+{ "action": "get_oldest_ts", "symbol": "EURUSD", "timeframe": "H1" }
+```
+
+**Respuesta exitosa:**
+```json
+{ "status": "ok", "symbol": "EURUSD", "timeframe": "H1", "oldest_ts": 1262563200 }
+```
+
+| Campo | Tipo | Descripción |
+|---|---|---|
+| `oldest_ts` | int | Unix UTC de la vela más antigua disponible en el broker |
+
+El ingestor usa esta acción para iniciar el backfill desde el inicio real del
+histórico sin que el usuario adivine cuántos días configurar.
+
 ---
 
 ## Timeframes soportados
@@ -145,6 +175,7 @@ Todos los errores usan la misma estructura:
 | `Invalid timeframe` | Valor de `timeframe` no está en la tabla de timeframes |
 | `Symbol not found in broker` | El símbolo no existe en el broker conectado |
 | `No data available for range` | El símbolo existe pero no hay histórico para el rango solicitado |
+| `History not synchronized yet` | El histórico se está descargando; el cliente debe reintentar el mismo rango más tarde |
 | `Request exceeds MAX_CANDLES_PER_REQUEST` | El rango solicitado supera el límite configurado (default: 5000 velas) |
 
 ---

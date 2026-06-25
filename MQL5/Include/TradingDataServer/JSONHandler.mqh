@@ -14,6 +14,7 @@
 #define ERR_NO_DATA           "{\"status\":\"error\",\"message\":\"No data available for range\"}"
 #define ERR_INVALID_TIMEFRAME "{\"status\":\"error\",\"message\":\"Invalid timeframe\"}"
 #define ERR_TOO_MANY_CANDLES  "{\"status\":\"error\",\"message\":\"Request exceeds MAX_CANDLES_PER_REQUEST\"}"
+#define ERR_NOT_SYNCED        "{\"status\":\"error\",\"message\":\"History not synchronized yet\"}"
 
 struct TradingRequest {
     string action;
